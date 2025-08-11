@@ -21,6 +21,9 @@ def init_cf():
 
     _cf.param.set_value('stabilizer.estimator', '2')
     _cf.param.set_value('locSrv.extQuatStdDev', 8.0e-3)
+    _cf.param.set_value('locSrv.extPosStdDev', 0.001)
+    # _cf.param.set_value('locSrv.flowStdDev', 10.0)      # large covariance for flow deck (optical flow)
+
     return _cf
 
 def get_scf():
