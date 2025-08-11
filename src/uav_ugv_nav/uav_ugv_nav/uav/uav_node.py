@@ -41,7 +41,7 @@ class CZFNode(Node):
         commander.go_to(self.landing_target.x, self.landing_target.y, 0.5, 0.0, 5.0)
         time.sleep(5.0)
 
-        commander.land(0.0, 5.0)
+        commander.land(0.35, 5.0)
         time.sleep(5.0)
 
 
