@@ -4,17 +4,29 @@ import threading
 from rclpy.node import Node
 from std_srvs.srv import Trigger
 from geometry_msgs.msg import PoseStamped
-from rclpy.executors import SingleThreadedExecutor
+from rclpy.executors import SingleThreadedExecutor, MultiThreadedExecutor
 from uav_ugv_nav.uav.cf_driver import init_cf, get_scf
 from cflib.utils.reset_estimator import reset_estimator
+from rclpy.callback_groups import ReentrantCallbackGroup
 from uav_ugv_nav.uav.optitrack_feed_node import OptiTrackFeedNode
 
+waypoints = [
+    [(0,1),(1,0)],
+    [(0,1),(1,0)],
+]
+
 class CZFNode(Node):
-    def __init__(self, name="czf_node"):
+    def __init__(self, mimic_communication=False, name="czf_node"):
         super().__init__(name)
         self.cf = init_cf()
         self.takoff_srv = self.create_service(Trigger, 'drone_takeoff', self.takeoff_cb)
         self.landed_client = self.create_client(Trigger, 'drone_landed')
+        self.mimic_communication = mimic_communication
+        self.timer = self.create_timer(1.0, self.step)
+        self.cycle_idx = 0
+    
+    def step(self):
+        self.get_logger().info("I'm alive")
     
     def takeoff_cb(self, request, response):
         self.get_logger().info("Received takeoff command")
@@ -22,87 +34,70 @@ class CZFNode(Node):
         response.success = True
         response.message = "Takeoff command accepted."
         
-        thread = threading.Thread(target=self.run_cycle)
-        thread.start()
+        threading.Thread(target=self.run_cycle).start()
 
-        print("Returning response")
+        self.get_logger().info("Returning takeoff response")
         return response
     
-    def visit_waypoints(self):
-        reset_estimator(self.cf)
-        print("Crazyflie initialized.")
+    def run_cycle(self):
+        self.get_logger().info("run cycle")
+        if self.cycle_idx == 0:
+            reset_estimator(self.cf)
         self.get_logger().info("Starting flight sequence...")
         commander = self.cf.high_level_commander
         self.cf.platform.send_arming_request(True)
         time.sleep(1.0)
 
-        commander.takeoff(0.7, 3.0, yaw=None)
+        commander.takeoff(0.7, 3.0)
         time.sleep(3.0)
 
-        # commander.go_to(1.0, 0.0, 0.5, 0.0, 5.0)
-        time.sleep(10.0)
-
-        # commander.go_to(0.0, 0.0, 0.5, 0.0, 5.0)
-        # time.sleep(5.0)
-
-        # commander.go_to(0.0, 1.0, 0.5, 0.0, 5.0)
-        # time.sleep(5.0)
-        # commander.go_to(1.0, 0.0, 0.5, 0.0, 5.0)
-        # time.sleep(5.0)
+        for waypoint in waypoints[self.cycle_idx]:
+            commander.go_to(waypoint[0], waypoint[1], 0.7, 0.0, 5.0)
+            time.sleep(5.0)
 
         self.get_landing_target()
-        print("Going to: ",self.landing_target.x, self.landing_target.y)
+
+
+        self.get_logger().info(f"Got landing target: {self.landing_target}")
         time.sleep(1.0)
         commander.go_to(self.landing_target.x, self.landing_target.y, 0.7, 0.0, 5.0)
         time.sleep(5.0)
-
-        # commander.land(0.0, 5.0)
         commander.land(0.39, 5.0)
         time.sleep(5.0)
 
-        # commander.stop()
-        # self.get_logger().info("Sequence complete.")
+        print("Finished visiting waypoints")
+        self.send_landed()
+        self.cycle_idx += 1
 
-        # self.cf.platform.send_arming_request(False)
-        # time.sleep(1.0)
 
-    def run_cycle(self, commuincation=True):
-        self.visit_waypoints()
-
-        if commuincation == False:
+    def send_landed(self):
+        if self.mimic_communication == True:
             return
-        if not self.landed_client.wait_for_service(timeout_sec=5.0):
-            self.get_logger().error("TBOT 'landed' service not available!")
-            return
-        self.get_logger().info("Calling TBOT 'landed' service to notify landing...")
-
-        req = Trigger.Request()
-        future = self.landed_client.call_async(req)
-
-        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
-        if future.done():
-            result = future.result()
-            if result.success:
-                self.get_logger().info(f"TBOT confirmed landed: {result.message}")
-            else:
-                self.get_logger().warn(f"TBOT 'landed' service call failed: {result.message}")
+        future = self.landed_client.call_async(Trigger.Request())
+        future.add_done_callback(self.send_landed_cb)
+        self.get_logger().info(f"Send landed")
+    
+    def send_landed_cb(self, future):
+        self.get_logger().info(f"Received landed callback")
+        response = future.result()
+        if response.success:
+            self.get_logger().info(f"Tbot confirmed landed: {response.message}")
         else:
-            self.get_logger().error("Timed out waiting for TBOT 'landed' service response")
+            self.get_logger().warn(f"Service call failed: {response.message}")
+            exit()
+
+    def landing_target_cb(self, msg):
+        self.landing_target = msg.pose.position
+        self.destroy_subscription(self.temp_sub)
 
     def get_landing_target(self):
         self.landing_target = None
         
-        def temp_callback(msg):
-            self.landing_target = msg.pose.position
-        
-        temp_sub = self.create_subscription(
-            PoseStamped, '/Robot_2/pose', temp_callback, 1)
-        
+        self.temp_sub = self.create_subscription(
+            PoseStamped, '/Robot_2/pose', self.landing_target_cb, 1, callback_group=ReentrantCallbackGroup())
         while self.landing_target is None:
-            rclpy.spin_once(self, timeout_sec=0.1)
+            time.sleep(0.1)
         
-        temp_sub.destroy()
-        print(f"Got landing target: {self.landing_target}")
         
 def main(args=None):
     rclpy.init(args=args)
@@ -112,26 +107,21 @@ def main(args=None):
 
     mocap_executor = SingleThreadedExecutor()
     mocap_executor.add_node(mocap_node)
-    mocap_thread = threading.Thread(target=mocap_executor.spin, daemon=True)
+    mocap_thread = threading.Thread(target=mocap_executor.spin)
 
     
-    uav_executor = SingleThreadedExecutor()
+    uav_executor = MultiThreadedExecutor(2)
     uav_executor.add_node(uav_node)
-    uav_thread = threading.Thread(target=uav_executor.spin, daemon=True)
+    uav_thread = threading.Thread(target=uav_executor.spin)
 
     mocap_thread.start()
     print("Waiting for mocap to work for 5s...")
     time.sleep(5)
+    print("Starting UAV Thread")
     uav_thread.start()
 
-    uav_node.visit_waypoints()
-
-    try:
-        # Wait for threads to finish (Ctrl+C raises KeyboardInterrupt)
-        while mocap_thread.is_alive() and uav_thread.is_alive():
-            time.sleep(0.5)
-    except KeyboardInterrupt:
-        print("Ctrl+C detected, shutting down...")
+    mocap_thread.join()
+    uav_thread.join()
 
     mocap_executor.shutdown()
     uav_executor.shutdown()
@@ -141,7 +131,7 @@ def main(args=None):
 
     rclpy.shutdown()
 
-    get_scf().close_link()  # Crazyflie cleanup
+    get_scf().close_link()
     time.sleep(1)
 
 
